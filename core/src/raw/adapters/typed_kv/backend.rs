@@ -123,13 +123,23 @@ impl<S: Adapter> Access for Backend<S> {
     async fn read(&self, path: &str, args: OpRead) -> Result<(RpRead, Self::Reader)> {
         let p = build_abs_path(&self.root, path);
 
-        let bs = match self.kv.get(&p).await? {
-            // TODO: we can reuse the metadata in value to build content range.
-            Some(bs) => bs.value,
-            None => return Err(Error::new(ErrorKind::NotFound, "kv doesn't have this path")),
-        };
+        // FIXME HAS_GET_RANGE
+        if true {
+            let range = args.range();
+            let bs = match self.kv.get_range(&p, range.offset(), range.size()).await? {
+                Some(bs) => bs.value,
+                None => return Err(Error::new(ErrorKind::NotFound, "kv doesn't have this path")),
+            };
 
-        Ok((RpRead::new(), bs.slice(args.range().to_range_as_usize())))
+            Ok((RpRead::new(), bs))
+        } else {
+            let bs = match self.kv.get(&p).await? {
+                // TODO: we can reuse the metadata in value to build content range.
+                Some(bs) => bs.value,
+                None => return Err(Error::new(ErrorKind::NotFound, "kv doesn't have this path")),
+            };
+            Ok((RpRead::new(), bs.slice(args.range().to_range_as_usize())))
+        }
     }
 
     async fn write(&self, path: &str, args: OpWrite) -> Result<(RpWrite, Self::Writer)> {

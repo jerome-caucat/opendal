@@ -104,6 +104,11 @@ pub trait Adapter: Send + Sync + Debug + Unpin + 'static {
     /// - return `Ok(None)` if this key is not exist.
     fn get(&self, path: &str) -> impl Future<Output = Result<Option<Buffer>>> + MaybeSend;
 
+    /// Get a key with range from service.
+    ///
+    /// - return `Ok(None)` if this key is not exist.
+    fn get_range(&self, path: &str, offset: u64, length: Option<u64>) -> impl Future<Output = Result<Option<Buffer>>> + MaybeSend;
+
     /// The blocking version of get.
     fn blocking_get(&self, path: &str) -> Result<Option<Buffer>> {
         let _ = path;

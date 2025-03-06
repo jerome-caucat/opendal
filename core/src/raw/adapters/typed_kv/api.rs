@@ -51,6 +51,9 @@ pub trait Adapter: Send + Sync + Debug + Unpin + 'static {
     /// Get a value from adapter.
     fn get(&self, path: &str) -> impl Future<Output = Result<Option<Value>>> + MaybeSend;
 
+    /// Get a range from adapter.
+    fn get_range(&self, path: &str, offset: u64, length: Option<u64>) -> impl Future<Output = Result<Option<Value>>> + MaybeSend;
+
     /// Get a value from adapter.
     fn blocking_get(&self, path: &str) -> Result<Option<Value>>;
 

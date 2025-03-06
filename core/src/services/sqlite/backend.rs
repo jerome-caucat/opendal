@@ -254,6 +254,25 @@ impl kv::Adapter for Adapter {
         Ok(value.map(Buffer::from))
     }
 
+    async fn get_range(&self, path: &str, offset: u64, length: Option<u64>) -> Result<Option<Buffer>> {
+        let pool = self.get_client().await?;
+
+        let substr_query = match length {
+            Some(len) => format!("SUBSTR(`{}`, {}, {})", self.value_field, offset + 1, len),
+            None => format!("SUBSTR(`{}`, {})", self.value_field, offset + 1),
+        };
+        let value: Option<Vec<u8>> = sqlx::query_scalar(&format!(
+            "SELECT {} FROM `{}` WHERE `{}` = $1 LIMIT 1",
+            substr_query, self.table, self.key_field
+        ))
+        .bind(path)
+        .fetch_optional(pool)
+        .await
+        .map_err(parse_sqlite_error)?;
+
+        Ok(value.map(Buffer::from))
+    }
+
     async fn set(&self, path: &str, value: Buffer) -> Result<()> {
         let pool = self.get_client().await?;
 

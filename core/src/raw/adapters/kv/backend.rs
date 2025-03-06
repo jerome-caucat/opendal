@@ -123,11 +123,23 @@ impl<S: Adapter> Access for Backend<S> {
 
     async fn read(&self, path: &str, args: OpRead) -> Result<(RpRead, Self::Reader)> {
         let p = build_abs_path(&self.root, path);
-        let bs = match self.kv.get(&p).await? {
-            Some(bs) => bs,
-            None => return Err(Error::new(ErrorKind::NotFound, "kv doesn't have this path")),
-        };
-        Ok((RpRead::new(), bs.slice(args.range().to_range_as_usize())))
+
+        // FIXME HAS_GET_RANGE
+        if true {
+            let range = args.range();
+            let bs = match self.kv.get_range(&p, range.offset(), range.size()).await? {
+                Some(bs) => bs,
+                None => return Err(Error::new(ErrorKind::NotFound, "kv doesn't have this path")),
+            };
+
+            Ok((RpRead::new(), bs))
+        } else {
+            let bs = match self.kv.get(&p).await? {
+                Some(bs) => bs,
+                None => return Err(Error::new(ErrorKind::NotFound, "kv doesn't have this path")),
+            };
+            Ok((RpRead::new(), bs.slice(args.range().to_range_as_usize())))
+        }
     }
 
     async fn write(&self, path: &str, _: OpWrite) -> Result<(RpWrite, Self::Writer)> {
