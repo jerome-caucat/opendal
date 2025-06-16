@@ -30,7 +30,7 @@ use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::SqlitePool;
 use tokio::sync::OnceCell;
 
-use crate::raw::adapters::kv;
+use crate::raw::oio;
 use crate::raw::*;
 use crate::services::SqliteConfig;
 use crate::*;
@@ -159,7 +159,7 @@ impl Builder for SqliteBuilder {
 
         let root = normalize_root(self.config.root.as_deref().unwrap_or("/"));
 
-        Ok(SqliteBackend::new(Adapter {
+        Ok(SqliteAccessor::new(SqliteCore {
             pool: OnceCell::new(),
             config,
             table,
@@ -170,10 +170,8 @@ impl Builder for SqliteBuilder {
     }
 }
 
-pub type SqliteBackend = kv::Backend<Adapter>;
-
 #[derive(Debug, Clone)]
-pub struct Adapter {
+pub struct SqliteCore {
     pool: OnceCell<SqlitePool>,
     config: SqliteConnectOptions,
 
@@ -182,7 +180,7 @@ pub struct Adapter {
     value_field: String,
 }
 
-impl Adapter {
+impl SqliteCore {
     async fn get_client(&self) -> Result<&SqlitePool> {
         self.pool
             .get_or_try_init(|| async {
@@ -192,51 +190,6 @@ impl Adapter {
                 Ok(pool)
             })
             .await
-    }
-}
-
-#[self_referencing]
-pub struct SqliteScanner {
-    pool: SqlitePool,
-    query: String,
-
-    #[borrows(pool, query)]
-    #[covariant]
-    stream: BoxStream<'this, Result<String>>,
-}
-
-impl Stream for SqliteScanner {
-    type Item = Result<String>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.with_stream_mut(|s| s.poll_next_unpin(cx))
-    }
-}
-
-unsafe impl Sync for SqliteScanner {}
-
-impl kv::Scan for SqliteScanner {
-    async fn next(&mut self) -> Result<Option<String>> {
-        <Self as StreamExt>::next(self).await.transpose()
-    }
-}
-
-impl kv::Adapter for Adapter {
-    type Scanner = SqliteScanner;
-
-    fn info(&self) -> kv::Info {
-        kv::Info::new(
-            Scheme::Sqlite,
-            &self.table,
-            Capability {
-                read: true,
-                write: true,
-                delete: true,
-                list: true,
-                shared: false,
-                ..Default::default()
-            },
-        )
     }
 
     async fn get(&self, path: &str) -> Result<Option<Buffer>> {
@@ -284,28 +237,74 @@ impl kv::Adapter for Adapter {
 
         Ok(())
     }
-
-    async fn scan(&self, path: &str) -> Result<Self::Scanner> {
-        let pool = self.get_client().await?;
-        let stream = SqliteScannerBuilder {
-            pool: pool.clone(),
-            query: format!(
-                "SELECT `{}` FROM `{}` WHERE `{}` LIKE $1",
-                self.key_field, self.table, self.key_field
-            ),
-            stream_builder: |pool, query| {
-                sqlx::query_scalar(query)
-                    .bind(format!("{path}%"))
-                    .fetch(pool)
-                    .map(|v| v.map_err(parse_sqlite_error))
-                    .boxed()
-            },
-        }
-        .build();
-
-        Ok(stream)
-    }
 }
+
+//#[self_referencing]
+//pub struct SqliteScanner {
+//    pool: SqlitePool,
+//    query: String,
+//
+//    #[borrows(pool, query)]
+//    #[covariant]
+//    stream: BoxStream<'this, Result<String>>,
+//}
+//
+//impl Stream for SqliteScanner {
+//    type Item = Result<String>;
+//
+//    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+//        self.with_stream_mut(|s| s.poll_next_unpin(cx))
+//    }
+//}
+//
+//unsafe impl Sync for SqliteScanner {}
+//
+//impl kv::Scan for SqliteScanner {
+//    async fn next(&mut self) -> Result<Option<String>> {
+//        <Self as StreamExt>::next(self).await.transpose()
+//    }
+//}
+//
+//impl kv::Adapter for Adapter {
+//    type Scanner = SqliteScanner;
+//
+//    fn info(&self) -> kv::Info {
+//        kv::Info::new(
+//            Scheme::Sqlite,
+//            &self.table,
+//            Capability {
+//                read: true,
+//                write: true,
+//                delete: true,
+//                list: true,
+//                shared: false,
+//                ..Default::default()
+//            },
+//        )
+//    }
+//
+//
+//    async fn scan(&self, path: &str) -> Result<Self::Scanner> {
+//        let pool = self.get_client().await?;
+//        let stream = SqliteScannerBuilder {
+//            pool: pool.clone(),
+//            query: format!(
+//                "SELECT `{}` FROM `{}` WHERE `{}` LIKE $1",
+//                self.key_field, self.table, self.key_field
+//            ),
+//            stream_builder: |pool, query| {
+//                sqlx::query_scalar(query)
+//                    .bind(format!("{path}%"))
+//                    .fetch(pool)
+//                    .map(|v| v.map_err(parse_sqlite_error))
+//                    .boxed()
+//            },
+//        }
+//        .build();
+//
+//        Ok(stream)
+//    }
+//}
 
 fn parse_sqlite_error(err: sqlx::Error) -> Error {
     let is_temporary = matches!(
@@ -325,3 +324,158 @@ fn parse_sqlite_error(err: sqlx::Error) -> Error {
     }
     error
 }
+
+/// SqliteAccessor implements Access trait directly
+#[derive(Debug, Clone)]
+pub struct SqliteAccessor {
+    core: std::sync::Arc<SqliteCore>,
+    root: String,
+    info: std::sync::Arc<AccessorInfo>,
+}
+
+impl SqliteAccessor {
+    fn new(core: SqliteCore) -> Self {
+        let info = AccessorInfo::default();
+        info.set_scheme(Scheme::Sqlite);
+        info.set_name(&core.table);
+        info.set_root("/");
+        info.set_native_capability(Capability {
+            read: true,
+            write: true,
+            delete: true,
+            stat: true, //? Set for redis, do we need?
+            write_can_empty: true, //? Set for redis, do we need?
+            list: true,
+            shared: false,
+            ..Default::default()
+        });
+
+        Self {
+            core: std::sync::Arc::new(core),
+            root: "/".to_string(),
+            info: std::sync::Arc::new(info),
+        }
+    }
+
+    fn with_normalized_root(mut self, root: String) -> Self {
+        self.info.set_root(&root);
+        self.root = root;
+        self
+    }
+}
+
+// TODO: finish refactor
+impl Access for SqliteAccessor {
+    type Reader = Buffer;
+    type Writer = RedisWriter;
+    type Lister = ();
+    type Deleter = oio::OneShotDeleter<RedisDeleter>;
+
+    fn info(&self) -> std::sync::Arc<AccessorInfo> {
+        self.info.clone()
+    }
+
+    async fn stat(&self, path: &str, _: OpStat) -> Result<RpStat> {
+        let p = build_abs_path(&self.root, path);
+
+        if p == build_abs_path(&self.root, "") {
+            Ok(RpStat::new(Metadata::new(EntryMode::DIR)))
+        } else {
+            let bs = self.core.get(&p).await?;
+            match bs {
+                Some(bs) => Ok(RpStat::new(
+                    Metadata::new(EntryMode::FILE).with_content_length(bs.len() as u64),
+                )),
+                None => Err(Error::new(ErrorKind::NotFound, "key not found in redis")),
+            }
+        }
+    }
+
+    async fn read(&self, path: &str, args: OpRead) -> Result<(RpRead, Self::Reader)> {
+        let p = build_abs_path(&self.root, path);
+        let bs = match self.core.get(&p).await? {
+            Some(bs) => bs,
+            None => return Err(Error::new(ErrorKind::NotFound, "key not found in redis")),
+        };
+        Ok((RpRead::new(), bs.slice(args.range().to_range_as_usize())))
+    }
+
+    async fn write(&self, path: &str, _: OpWrite) -> Result<(RpWrite, Self::Writer)> {
+        let p = build_abs_path(&self.root, path);
+        Ok((RpWrite::new(), RedisWriter::new(self.core.clone(), p)))
+    }
+
+    async fn delete(&self) -> Result<(RpDelete, Self::Deleter)> {
+        Ok((
+            RpDelete::default(),
+            oio::OneShotDeleter::new(RedisDeleter::new(self.core.clone(), self.root.clone())),
+        ))
+    }
+
+    async fn list(&self, path: &str, _: OpList) -> Result<(RpList, Self::Lister)> {
+        let _ = build_abs_path(&self.root, path);
+        // Redis doesn't support listing keys, return empty list
+        // TODO: Sqlite does, I think via the SqliteScanner commented above
+        Ok((RpList::default(), ()))
+    }
+}
+
+pub struct RedisWriter {
+    core: std::sync::Arc<RedisCore>,
+    path: String,
+    buffer: oio::QueueBuf,
+}
+
+impl RedisWriter {
+    fn new(core: std::sync::Arc<RedisCore>, path: String) -> Self {
+        Self {
+            core,
+            path,
+            buffer: oio::QueueBuf::new(),
+        }
+    }
+}
+
+impl oio::Write for RedisWriter {
+    async fn write(&mut self, bs: Buffer) -> Result<()> {
+        self.buffer.push(bs);
+        Ok(())
+    }
+
+    async fn close(&mut self) -> Result<Metadata> {
+        let buf = self.buffer.clone().collect();
+        let length = buf.len() as u64;
+        self.core.set(&self.path, buf).await?;
+
+        let meta = Metadata::new(EntryMode::from_path(&self.path)).with_content_length(length);
+        Ok(meta)
+    }
+
+    async fn abort(&mut self) -> Result<()> {
+        self.buffer.clear();
+        Ok(())
+    }
+}
+
+pub struct RedisDeleter {
+    core: std::sync::Arc<RedisCore>,
+    root: String,
+}
+
+impl RedisDeleter {
+    fn new(core: std::sync::Arc<RedisCore>, root: String) -> Self {
+        Self { core, root }
+    }
+}
+
+impl oio::OneShotDelete for RedisDeleter {
+    async fn delete_once(&self, path: String, _: OpDelete) -> Result<()> {
+        let p = build_abs_path(&self.root, &path);
+        self.core.delete(&p).await?;
+        Ok(())
+    }
+}
+
+// TODO: add tests
+
+
